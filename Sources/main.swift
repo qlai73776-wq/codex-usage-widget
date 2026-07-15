@@ -1,5 +1,7 @@
 import AppKit
+import CryptoKit
 import Foundation
+import Security
 import ServiceManagement
 import UserNotifications
 import WidgetKit
@@ -25,6 +27,105 @@ struct UsageSnapshot {
     var error: String?
 }
 
+struct SavedAccount: Codable, Identifiable {
+    let id: String
+    var email: String
+    var plan: String
+    var remaining: Int
+    var used: Int
+    var resetsAt: Double
+    var lastUpdated: Double
+}
+
+final class AccountVault {
+    static let shared = AccountVault()
+    private let service = "io.github.codexusage.accounts"
+    private let support = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Codex Usage", isDirectory: true)
+    private var indexURL: URL { support.appendingPathComponent("accounts.json") }
+
+    func accounts() -> [SavedAccount] {
+        guard let data = try? Data(contentsOf: indexURL) else { return [] }
+        return (try? JSONDecoder().decode([SavedAccount].self, from: data)) ?? []
+    }
+
+    func saveCurrent(snapshot: UsageSnapshot) throws -> SavedAccount {
+        guard snapshot.email.contains("@") else { throw VaultError.message("请先在 Codex 登录账号并刷新") }
+        let auth = try readCurrentAuth()
+        let id = String(SHA256.hash(data: Data(snapshot.email.lowercased().utf8)).compactMap { String(format: "%02x", $0) }.joined().prefix(16))
+        try storeSecret(auth, account: id)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let home = support.appendingPathComponent("Accounts/\(id)", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        try storeSecret(auth, service: "Codex Auth", account: codexKeychainAccount(home: home))
+        var all = accounts().filter { $0.id != id }
+        let item = SavedAccount(id: id, email: snapshot.email, plan: snapshot.plan, remaining: snapshot.remaining, used: snapshot.used, resetsAt: snapshot.resetsAt?.timeIntervalSince1970 ?? 0, lastUpdated: Date().timeIntervalSince1970)
+        all.append(item)
+        try writeIndex(all)
+        return item
+    }
+
+    func update(_ account: SavedAccount) {
+        var all = accounts()
+        guard let position = all.firstIndex(where: { $0.id == account.id }) else { return }
+        all[position] = account
+        try? writeIndex(all)
+    }
+
+    func remove(_ id: String) {
+        try? writeIndex(accounts().filter { $0.id != id })
+        SecItemDelete([kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: id] as CFDictionary)
+    }
+
+    func switchTo(_ id: String) throws {
+        guard let auth = secret(account: id) else { throw VaultError.message("账号凭据不存在，请重新保存该账号") }
+        let codexHome = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
+        try FileManager.default.createDirectory(at: codexHome, withIntermediateDirectories: true)
+        try auth.write(to: codexHome.appendingPathComponent("auth.json"), options: [.atomic])
+        let keyAccount = codexKeychainAccount(home: codexHome)
+        try storeSecret(auth, service: "Codex Auth", account: keyAccount)
+    }
+
+    func home(for id: String) -> URL { support.appendingPathComponent("Accounts/\(id)", isDirectory: true) }
+
+    private func readCurrentAuth() throws -> Data {
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/auth.json")
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { throw VaultError.message("没有找到 Codex 登录状态") }
+        guard (try? JSONSerialization.jsonObject(with: data)) != nil else { throw VaultError.message("Codex 登录状态格式无效") }
+        return data
+    }
+
+    private func writeIndex(_ accounts: [SavedAccount]) throws {
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        try JSONEncoder().encode(accounts).write(to: indexURL, options: .atomic)
+    }
+
+    private func storeSecret(_ data: Data, account: String) throws { try storeSecret(data, service: service, account: account) }
+    private func storeSecret(_ data: Data, service: String, account: String) throws {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
+        let status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            var add = query; add[kSecValueData as String] = data
+            guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else { throw VaultError.message("无法写入 macOS 钥匙串") }
+        } else if status != errSecSuccess { throw VaultError.message("无法更新 macOS 钥匙串") }
+    }
+
+    private func secret(account: String) -> Data? {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
+        return result as? Data
+    }
+
+    private func codexKeychainAccount(home: URL) -> String {
+        let path = home.resolvingSymlinksInPath().path
+        let digest = SHA256.hash(data: Data(path.utf8)).map { String(format: "%02x", $0) }.joined()
+        return "cli|\(digest.prefix(16))"
+    }
+
+    enum VaultError: LocalizedError { case message(String); var errorDescription: String? { if case .message(let value) = self { return value }; return nil } }
+}
+
 final class CodexClient {
     var onUpdate: ((UsageSnapshot) -> Void)?
     private var process: Process?
@@ -36,6 +137,13 @@ final class CodexClient {
     private var resetRequestTimer: Timer?
     private var authModificationDate: Date?
     private var nextID = 1
+    private let codexHome: URL?
+    private let publishesWidget: Bool
+
+    init(codexHome: URL? = nil, publishesWidget: Bool = true) {
+        self.codexHome = codexHome
+        self.publishesWidget = publishesWidget
+    }
 
     func start() {
         launchServer()
@@ -74,6 +182,9 @@ final class CodexClient {
         send(method: "account/usage/read", params: [:], id: 4)
     }
 
+    func reloadAccount() { launchServer() }
+    func republish() { publish() }
+
     private func launchServer() {
         process?.terminate()
         buffer.removeAll(keepingCapacity: true)
@@ -95,6 +206,11 @@ final class CodexClient {
         let stdoutPipe = Pipe()
         task.executableURL = URL(fileURLWithPath: executable)
         task.arguments = ["app-server"]
+        if let codexHome {
+            var environment = ProcessInfo.processInfo.environment
+            environment["CODEX_HOME"] = codexHome.path
+            task.environment = environment
+        }
         task.standardInput = stdinPipe
         task.standardOutput = stdoutPipe
         task.standardError = Pipe()
@@ -261,6 +377,16 @@ final class CodexClient {
     }
 
     private func publish() {
+        var saved = AccountVault.shared.accounts()
+        if let position = saved.firstIndex(where: { $0.email.caseInsensitiveCompare(snapshot.email) == .orderedSame }), snapshot.lastUpdated != nil {
+            saved[position].plan = snapshot.plan
+            saved[position].remaining = snapshot.remaining
+            saved[position].used = snapshot.used
+            saved[position].resetsAt = snapshot.resetsAt?.timeIntervalSince1970 ?? 0
+            saved[position].lastUpdated = snapshot.lastUpdated?.timeIntervalSince1970 ?? 0
+            AccountVault.shared.update(saved[position])
+        }
+        let accountValues: [[String: Any]] = saved.map { ["id": $0.id, "email": $0.email, "plan": $0.plan, "remaining": $0.remaining, "used": $0.used, "resetsAt": $0.resetsAt, "lastUpdated": $0.lastUpdated, "current": $0.email.caseInsensitiveCompare(snapshot.email) == .orderedSame] }
         let values: [String: Any] = [
             "email": snapshot.email,
             "plan": snapshot.plan,
@@ -273,14 +399,15 @@ final class CodexClient {
             "resetCredits": snapshot.resetCredits,
             "resetCreditID": snapshot.resetCreditID ?? "",
             "resetStatus": snapshot.resetStatus ?? "",
-            "lastUpdated": snapshot.lastUpdated?.timeIntervalSince1970 ?? 0
+            "lastUpdated": snapshot.lastUpdated?.timeIntervalSince1970 ?? 0,
+            "accounts": accountValues
         ]
-        if let data = try? JSONSerialization.data(withJSONObject: values) {
+        if publishesWidget, let data = try? JSONSerialization.data(withJSONObject: values) {
             let liveDirectory = URL(fileURLWithPath: "/private/tmp/io.github.codexusage", isDirectory: true)
             try? FileManager.default.createDirectory(at: liveDirectory, withIntermediateDirectories: true)
             try? data.write(to: liveDirectory.appendingPathComponent("usage.json"), options: .atomic)
         }
-        WidgetCenter.shared.reloadTimelines(ofKind: "CodexUsageWidget")
+        if publishesWidget { WidgetCenter.shared.reloadTimelines(ofKind: "CodexUsageWidget") }
         onUpdate?(snapshot)
     }
 }
@@ -428,6 +555,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var statusDetailItem: NSMenuItem!
     private var sizeItems: [NSMenuItem] = []
     private var themeItems: [NSMenuItem] = []
+    private var accountsMenu = NSMenu(title: "Codex 账号")
+    private var accountClients: [String: CodexClient] = [:]
+    private var switchRequestTimer: Timer?
+    private var latestSnapshot = UsageSnapshot()
     private let defaults = UserDefaults.standard
     private let baseSize = NSSize(width: 360, height: 260)
 
@@ -438,15 +569,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         createStatusItem()
         applySavedPreferences()
         client.onUpdate = { [weak self] snapshot in
+            self?.latestSnapshot = snapshot
             self?.usageView.snapshot = snapshot
             self?.statusItem.button?.title = "  \(snapshot.remaining)%"
             self?.statusDetailItem.title = "\(snapshot.email) · \(snapshot.plan) · 剩余 \(snapshot.remaining)%"
             self?.checkUsageAlert(snapshot)
+            self?.rebuildAccountsMenu()
         }
         client.start()
+        startSavedAccountClients()
+        switchRequestTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.consumeSwitchRequest() }
     }
 
-    func applicationWillTerminate(_ notification: Notification) { client.stop() }
+    func applicationWillTerminate(_ notification: Notification) { client.stop(); accountClients.values.forEach { $0.stop() } }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         completionHandler([.banner, .sound])
@@ -477,6 +612,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         menu.addItem(statusDetailItem)
         menu.addItem(.separator())
         menu.addItem(withTitle: "立即刷新", action: #selector(refresh), keyEquivalent: "r")
+        let save = NSMenuItem(title: "保存当前 Codex 账号", action: #selector(saveCurrentAccount), keyEquivalent: "")
+        save.target = self
+        menu.addItem(save)
+        let accounts = NSMenuItem(title: "Codex 账号", action: nil, keyEquivalent: "")
+        accounts.submenu = accountsMenu
+        menu.addItem(accounts)
         alertItem = NSMenuItem(title: "用量提醒（20% / 10%）", action: #selector(toggleAlerts), keyEquivalent: "")
         alertItem.target = self
         menu.addItem(alertItem)
@@ -490,6 +631,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     @objc private func refresh() { client.refresh() }
+
+    @objc private func saveCurrentAccount() {
+        do {
+            let account = try AccountVault.shared.saveCurrent(snapshot: latestSnapshot)
+            startClient(for: account)
+            rebuildAccountsMenu()
+            client.refresh()
+        } catch { showAccountError(error.localizedDescription) }
+    }
+
+    @objc private func selectAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        switchAccount(id)
+    }
+
+    @objc private func deleteAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        accountClients.removeValue(forKey: id)?.stop()
+        AccountVault.shared.remove(id)
+        rebuildAccountsMenu()
+        client.refresh()
+    }
+
+    private func switchAccount(_ id: String) {
+        do {
+            try AccountVault.shared.switchTo(id)
+            client.reloadAccount()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.client.refresh() }
+        } catch { showAccountError(error.localizedDescription) }
+    }
+
+    private func startSavedAccountClients() { AccountVault.shared.accounts().forEach(startClient) }
+
+    private func startClient(for account: SavedAccount) {
+        guard accountClients[account.id] == nil else { return }
+        let probe = CodexClient(codexHome: AccountVault.shared.home(for: account.id), publishesWidget: false)
+        probe.onUpdate = { [weak self] snapshot in
+            guard snapshot.lastUpdated != nil else { return }
+            var updated = account
+            updated.email = snapshot.email
+            updated.plan = snapshot.plan
+            updated.remaining = snapshot.remaining
+            updated.used = snapshot.used
+            updated.resetsAt = snapshot.resetsAt?.timeIntervalSince1970 ?? 0
+            updated.lastUpdated = snapshot.lastUpdated?.timeIntervalSince1970 ?? 0
+            AccountVault.shared.update(updated)
+            self?.rebuildAccountsMenu()
+            self?.client.republish()
+        }
+        accountClients[account.id] = probe
+        probe.start()
+    }
+
+    private func rebuildAccountsMenu() {
+        accountsMenu.removeAllItems()
+        let saved = AccountVault.shared.accounts()
+        if saved.isEmpty {
+            let empty = NSMenuItem(title: "尚未保存账号", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            accountsMenu.addItem(empty)
+            return
+        }
+        for account in saved.sorted(by: { $0.remaining > $1.remaining }) {
+            let current = account.email.caseInsensitiveCompare(latestSnapshot.email) == .orderedSame
+            let item = NSMenuItem(title: "\(current ? "✓ " : "")\(account.email) · 剩余 \(account.remaining)%", action: #selector(selectAccount), keyEquivalent: "")
+            item.target = self; item.representedObject = account.id
+            accountsMenu.addItem(item)
+            let remove = NSMenuItem(title: "    移除 \(account.email)", action: #selector(deleteAccount), keyEquivalent: "")
+            remove.target = self; remove.representedObject = account.id
+            accountsMenu.addItem(remove)
+        }
+    }
+
+    private func consumeSwitchRequest() {
+        let url = URL(fileURLWithPath: "/private/tmp/io.github.codexusage/switch-request.json")
+        guard let data = try? Data(contentsOf: url), let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let id = json["accountID"] as? String else { return }
+        try? FileManager.default.removeItem(at: url)
+        switchAccount(id)
+    }
+
+    private func showAccountError(_ message: String) {
+        let alert = NSAlert(); alert.messageText = "Codex 账号操作失败"; alert.informativeText = message; alert.runModal()
+    }
     @objc private func showPanel() { panel.orderFrontRegardless() }
     @objc private func hidePanel() { panel.orderOut(nil) }
     @objc private func quit() { NSApp.terminate(nil) }

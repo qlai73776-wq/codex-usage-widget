@@ -1,6 +1,6 @@
 # Codex Usage Widget
 
-A native macOS menu bar companion and WidgetKit widget for monitoring the currently signed-in Codex account.
+A native macOS menu bar companion and WidgetKit widget for monitoring and switching between Codex accounts.
 
 ![macOS](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Swift](https://img.shields.io/badge/Swift-5-orange?logo=swift)
@@ -9,6 +9,8 @@ A native macOS menu bar companion and WidgetKit widget for monitoring the curren
 ## Features
 
 - Current Codex account and plan
+- Save multiple Codex accounts and refresh their quotas independently
+- One-click account switching from the menu bar or medium/large widget
 - Weekly remaining quota, used percentage, and reset time
 - Lifetime and daily token summaries when provided by Codex
 - Native small, medium, and large macOS widgets
@@ -22,14 +24,15 @@ A native macOS menu bar companion and WidgetKit widget for monitoring the curren
 
 ## Privacy
 
-Codex Usage Widget is local-only. It starts the official local `codex app-server` process and requests account and rate-limit snapshots through its documented JSON-RPC interface.
+Codex Usage Widget is local-only. It starts the official local `codex app-server` process and requests account and rate-limit snapshots through its JSON-RPC interface.
 
 The app:
 
 - does not read browser cookies;
 - does not upload account or usage data;
 - does not bundle API keys, access tokens, email addresses, or machine-specific paths;
-- does not read `~/.codex/auth.json` directly;
+- reads the current `~/.codex/auth.json` only when you explicitly choose **Save Current Codex Account**;
+- stores saved login credentials in macOS Keychain and never in the repository or usage snapshot;
 - writes only a short-lived usage snapshot to `/private/tmp/io.github.codexusage/usage.json` so the sandboxed WidgetKit extension can render it.
 
 The snapshot contains display data such as email, plan, remaining percentage, reset time, and aggregate token counts. macOS normally clears `/private/tmp` during restart; the menu bar app recreates the snapshot after login.
@@ -73,6 +76,14 @@ Native WidgetKit widget
 ```
 
 The menu bar's **Refresh Now** action uses the same path as automatic refresh; it is optional and intended for diagnostics.
+
+## Multiple accounts
+
+1. Sign in to the first account in Codex and choose **Save Current Codex Account** from the menu bar.
+2. Sign in to another account in Codex, then save it the same way.
+3. Use **Codex Accounts** in the menu bar, or **Switch** on a medium/large widget, to change accounts.
+
+Each saved account gets an isolated local Codex home for quota refresh. Credentials are stored in macOS Keychain. Removing an account from the menu deletes the widget's saved Keychain item; it does not delete the account itself.
 
 ## Reset credits
 

@@ -31,6 +31,28 @@ struct ConfirmResetIntent: AppIntent {
     }
 }
 
+struct SwitchCodexAccountIntent: AppIntent {
+    static var title: LocalizedStringResource = "切换 Codex 账号"
+    static var openAppWhenRun = false
+    @Parameter(title: "账号") var accountID: String
+    init() {}
+    init(accountID: String) { self.accountID = accountID }
+    func perform() async throws -> some IntentResult {
+        let payload = try JSONSerialization.data(withJSONObject: ["accountID": accountID])
+        try payload.write(to: liveDirectory.appendingPathComponent("switch-request.json"), options: .atomic)
+        return .result()
+    }
+}
+
+struct AccountEntry: Identifiable {
+    let id: String
+    let email: String
+    let plan: String
+    let remaining: Int
+    let resetsAt: Date?
+    let current: Bool
+}
+
 struct UsageEntry: TimelineEntry {
     let date: Date
     let email: String
@@ -45,11 +67,12 @@ struct UsageEntry: TimelineEntry {
     let resetStatus: String
     let resetArmed: Bool
     let updatedAt: Date?
+    let accounts: [AccountEntry]
 }
 
 struct UsageProvider: TimelineProvider {
     func placeholder(in context: Context) -> UsageEntry {
-        UsageEntry(date: .now, email: "Codex 账户", plan: "PLUS", remaining: 88, used: 12, resetsAt: .now.addingTimeInterval(5 * 86400), lifetimeTokens: 128_000_000, todayTokens: 420_000, streakDays: 6, resetCredits: 1, resetStatus: "", resetArmed: false, updatedAt: .now)
+        UsageEntry(date: .now, email: "Codex 账户", plan: "PLUS", remaining: 88, used: 12, resetsAt: .now.addingTimeInterval(5 * 86400), lifetimeTokens: 128_000_000, todayTokens: 420_000, streakDays: 6, resetCredits: 1, resetStatus: "", resetArmed: false, updatedAt: .now, accounts: [])
     }
 
     func getSnapshot(in context: Context, completion: @escaping (UsageEntry) -> Void) {
@@ -86,6 +109,11 @@ struct UsageProvider: TimelineProvider {
             guard let timestamp = value(key) as? NSNumber, timestamp.doubleValue > 0 else { return nil }
             return Date(timeIntervalSince1970: timestamp.doubleValue)
         }
+        let accounts = (value("accounts") as? [[String: Any]] ?? []).compactMap { item -> AccountEntry? in
+            guard let id = item["id"] as? String, let email = item["email"] as? String else { return nil }
+            let timestamp = (item["resetsAt"] as? NSNumber)?.doubleValue ?? 0
+            return AccountEntry(id: id, email: email, plan: item["plan"] as? String ?? "—", remaining: (item["remaining"] as? NSNumber)?.intValue ?? 0, resetsAt: timestamp > 0 ? Date(timeIntervalSince1970: timestamp) : nil, current: item["current"] as? Bool ?? false)
+        }
         return UsageEntry(
             date: .now,
             email: value("email") as? String ?? "打开“Codex 用量”同步",
@@ -99,7 +127,8 @@ struct UsageProvider: TimelineProvider {
             resetCredits: (value("resetCredits") as? NSNumber)?.intValue ?? 0,
             resetStatus: value("resetStatus") as? String ?? "",
             resetArmed: resetArmed,
-            updatedAt: date("lastUpdated")
+            updatedAt: date("lastUpdated"),
+            accounts: accounts
         )
     }
 }
@@ -142,6 +171,10 @@ struct CodexUsageWidgetView: View {
                 }
             }
             ProgressView(value: Double(entry.remaining), total: 100).tint(entry.remaining <= 20 ? .orange : .green)
+            if !entry.accounts.isEmpty {
+                accountList
+                Divider()
+            }
             HStack {
                 metric("已用", "\(entry.used)%")
                 metric("今日 Tokens", compact(entry.todayTokens))
@@ -158,6 +191,27 @@ struct CodexUsageWidgetView: View {
             .font(.caption2).foregroundStyle(.secondary)
         }
         .containerBackground(.fill.tertiary, for: .widget)
+    }
+
+    private var accountList: some View {
+        VStack(spacing: 6) {
+            ForEach(Array(entry.accounts.sorted(by: { $0.remaining > $1.remaining }).prefix(family == .systemLarge ? 5 : 2))) { account in
+                HStack(spacing: 7) {
+                    Circle().fill(account.current ? Color.green : Color.secondary.opacity(0.35)).frame(width: 7, height: 7)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(account.email).font(.caption.bold()).lineLimit(1)
+                        Text("\(account.plan) · 剩余 \(account.remaining)%").font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if account.current {
+                        Text("当前").font(.caption2.bold()).foregroundStyle(.green)
+                    } else {
+                        Button(intent: SwitchCodexAccountIntent(accountID: account.id)) { Text("切换") }
+                            .buttonStyle(.bordered).font(.caption2)
+                    }
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -214,7 +268,7 @@ struct CodexUsageWidget: Widget {
             CodexUsageWidgetView(entry: entry)
         }
         .configurationDisplayName("Codex 用量")
-        .description("查看当前账户的周额度、重置时间和 Token 用量。")
+        .description("查看多个 Codex 账号的额度，并可一键切换账号。")
         .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
     }
 }
