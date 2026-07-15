@@ -52,13 +52,30 @@ final class AccountVault {
     func saveCurrent(snapshot: UsageSnapshot) throws -> SavedAccount {
         guard snapshot.email.contains("@") else { throw VaultError.message("请先在 Codex 登录账号并刷新") }
         let auth = try readCurrentAuth()
-        let id = String(SHA256.hash(data: Data(snapshot.email.lowercased().utf8)).compactMap { String(format: "%02x", $0) }.joined().prefix(16))
+        let id = accountID(for: snapshot.email)
         try storeSecret(auth, account: id)
         try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         let home = support.appendingPathComponent("Accounts/\(id)", isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         try "cli_auth_credentials_store = \"keyring\"\n".write(to: home.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
         try storeSecret(auth, service: "Codex Auth", account: codexKeychainAccount(home: home))
+        var all = accounts().filter { $0.id != id }
+        let item = SavedAccount(id: id, email: snapshot.email, plan: snapshot.plan, remaining: snapshot.remaining, used: snapshot.used, resetsAt: snapshot.resetsAt?.timeIntervalSince1970 ?? 0, lastUpdated: Date().timeIntervalSince1970)
+        all.append(item)
+        try writeIndex(all)
+        return item
+    }
+
+    func importLoggedIn(snapshot: UsageSnapshot, from temporaryHome: URL) throws -> SavedAccount {
+        guard snapshot.email.contains("@") else { throw VaultError.message("登录完成，但没有读取到账号信息") }
+        let temporaryAccount = codexKeychainAccount(home: temporaryHome)
+        guard let auth = secret(service: "Codex Auth", account: temporaryAccount) else {
+            throw VaultError.message("没有读取到新账号的 Codex 登录凭据")
+        }
+        let id = accountID(for: snapshot.email)
+        try storeSecret(auth, account: id)
+        let finalHome = prepareHome(for: id)
+        try storeSecret(auth, service: "Codex Auth", account: codexKeychainAccount(home: finalHome))
         var all = accounts().filter { $0.id != id }
         let item = SavedAccount(id: id, email: snapshot.email, plan: snapshot.plan, remaining: snapshot.remaining, used: snapshot.used, resetsAt: snapshot.resetsAt?.timeIntervalSince1970 ?? 0, lastUpdated: Date().timeIntervalSince1970)
         all.append(item)
@@ -89,6 +106,10 @@ final class AccountVault {
 
     func home(for id: String) -> URL { support.appendingPathComponent("Accounts/\(id)", isDirectory: true) }
 
+    func accountID(for email: String) -> String {
+        String(SHA256.hash(data: Data(email.lowercased().utf8)).map { String(format: "%02x", $0) }.joined().prefix(16))
+    }
+
     func prepareHome(for id: String) -> URL {
         let url = home(for: id)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -96,6 +117,13 @@ final class AccountVault {
         if !FileManager.default.fileExists(atPath: config.path) {
             try? "cli_auth_credentials_store = \"keyring\"\n".write(to: config, atomically: true, encoding: .utf8)
         }
+        return url
+    }
+
+    func makeTemporaryLoginHome() throws -> URL {
+        let url = support.appendingPathComponent("Pending/\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try "cli_auth_credentials_store = \"keyring\"\n".write(to: url.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
         return url
     }
 
@@ -122,6 +150,10 @@ final class AccountVault {
     }
 
     private func secret(account: String) -> Data? {
+        secret(service: service, account: account)
+    }
+
+    private func secret(service: String, account: String) -> Data? {
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
         var result: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
@@ -139,6 +171,8 @@ final class AccountVault {
 
 final class CodexClient {
     var onUpdate: ((UsageSnapshot) -> Void)?
+    var onLoginURL: ((URL) -> Void)?
+    var onLoginCompleted: ((Bool, String?) -> Void)?
     private var process: Process?
     private var input: FileHandle?
     private var buffer = Data()
@@ -150,6 +184,8 @@ final class CodexClient {
     private var nextID = 1
     private let codexHome: URL?
     private let publishesWidget: Bool
+    private var loginRequested = false
+    private var initialized = false
 
     init(codexHome: URL? = nil, publishesWidget: Bool = true) {
         self.codexHome = codexHome
@@ -195,10 +231,15 @@ final class CodexClient {
 
     func reloadAccount() { launchServer() }
     func republish() { publish() }
+    func beginChatGPTLogin() {
+        loginRequested = true
+        if initialized { send(method: "account/login/start", params: ["type": "chatgpt", "appBrand": "codex", "useHostedLoginSuccessPage": true], id: 20) }
+    }
 
     private func launchServer() {
         process?.terminate()
         buffer.removeAll(keepingCapacity: true)
+        initialized = false
 
         let candidates = [
             "/Applications/ChatGPT.app/Contents/Resources/codex",
@@ -269,7 +310,9 @@ final class CodexClient {
 
     private func handle(_ json: [String: Any]) {
         if let id = json["id"] as? Int, id == 1 {
+            initialized = true
             send(method: "initialized", params: [:])
+            if loginRequested { send(method: "account/login/start", params: ["type": "chatgpt", "appBrand": "codex", "useHostedLoginSuccessPage": true], id: 20) }
             refresh()
             return
         }
@@ -278,10 +321,16 @@ final class CodexClient {
             if id == 3 { parseLimits(result) }
             if id == 4 { parseUsage(result) }
             if id == 5 { parseResetOutcome(result) }
+            if id == 20, let value = result["authUrl"] as? String, let url = URL(string: value) { onLoginURL?(url) }
             return
         }
         if let method = json["method"] as? String {
-            if method == "account/updated" || method == "account/login/completed" {
+            if method == "account/login/completed" {
+                let params = json["params"] as? [String: Any]
+                let success = params?["success"] as? Bool ?? false
+                onLoginCompleted?(success, params?["error"] as? String)
+                if success { refresh() }
+            } else if method == "account/updated" {
                 refresh()
             } else if method == "account/rateLimits/updated",
                       let params = json["params"] as? [String: Any],
@@ -389,7 +438,9 @@ final class CodexClient {
 
     private func publish() {
         var saved = AccountVault.shared.accounts()
-        if let position = saved.firstIndex(where: { $0.email.caseInsensitiveCompare(snapshot.email) == .orderedSame }), snapshot.lastUpdated != nil {
+        let currentID = AccountVault.shared.accountID(for: snapshot.email)
+        if let position = saved.firstIndex(where: { $0.id == currentID || $0.email.caseInsensitiveCompare(snapshot.email) == .orderedSame }), snapshot.lastUpdated != nil {
+            saved[position].email = snapshot.email
             saved[position].plan = snapshot.plan
             saved[position].remaining = snapshot.remaining
             saved[position].used = snapshot.used
@@ -570,6 +621,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var accountClients: [String: CodexClient] = [:]
     private var switchRequestTimer: Timer?
     private var latestSnapshot = UsageSnapshot()
+    private var pendingLoginClient: CodexClient?
+    private var pendingLoginHome: URL?
+    private var pendingLoginSucceeded = false
     private let defaults = UserDefaults.standard
     private let baseSize = NSSize(width: 360, height: 260)
 
@@ -623,6 +677,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         menu.addItem(statusDetailItem)
         menu.addItem(.separator())
         menu.addItem(withTitle: "立即刷新", action: #selector(refresh), keyEquivalent: "r")
+        let add = NSMenuItem(title: "添加另一个 Codex 账号…", action: #selector(addAnotherAccount), keyEquivalent: "")
+        add.target = self
+        menu.addItem(add)
         let save = NSMenuItem(title: "保存当前 Codex 账号", action: #selector(saveCurrentAccount), keyEquivalent: "")
         save.target = self
         menu.addItem(save)
@@ -650,6 +707,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             rebuildAccountsMenu()
             client.refresh()
         } catch { showAccountError(error.localizedDescription) }
+    }
+
+    @objc private func addAnotherAccount() {
+        guard pendingLoginClient == nil else {
+            showAccountError("已有一个登录流程正在进行，请先在浏览器完成登录。")
+            return
+        }
+        do {
+            let home = try AccountVault.shared.makeTemporaryLoginHome()
+            let loginClient = CodexClient(codexHome: home, publishesWidget: false)
+            pendingLoginHome = home
+            pendingLoginClient = loginClient
+            pendingLoginSucceeded = false
+            loginClient.onLoginURL = { url in NSWorkspace.shared.open(url) }
+            loginClient.onLoginCompleted = { [weak self] success, error in
+                guard let self else { return }
+                if success {
+                    self.pendingLoginSucceeded = true
+                } else {
+                    self.finishPendingLogin(error: error ?? "Codex 登录没有完成")
+                }
+            }
+            loginClient.onUpdate = { [weak self] snapshot in
+                guard let self, self.pendingLoginSucceeded, snapshot.lastUpdated != nil, snapshot.email.contains("@"), let home = self.pendingLoginHome else { return }
+                do {
+                    let account = try AccountVault.shared.importLoggedIn(snapshot: snapshot, from: home)
+                    self.finishPendingLogin(error: nil)
+                    self.startClient(for: account)
+                    self.rebuildAccountsMenu()
+                    self.client.republish()
+                    let notice = NSUserNotification()
+                    notice.title = "Codex 账号已添加"
+                    notice.informativeText = "已保存新账号，可在小组件中直接切换。"
+                    NSUserNotificationCenter.default.deliver(notice)
+                } catch {
+                    self.finishPendingLogin(error: error.localizedDescription)
+                }
+            }
+            loginClient.start()
+            loginClient.beginChatGPTLogin()
+        } catch { showAccountError(error.localizedDescription) }
+    }
+
+    private func finishPendingLogin(error: String?) {
+        pendingLoginClient?.stop()
+        pendingLoginClient = nil
+        pendingLoginHome = nil
+        pendingLoginSucceeded = false
+        if let error { showAccountError(error) }
     }
 
     @objc private func selectAccount(_ sender: NSMenuItem) {

@@ -81,8 +81,8 @@ The menu bar's **Refresh Now** action uses the same path as automatic refresh; i
 
 ## Multiple accounts
 
-1. Sign in to the first account in Codex and choose **Save Current Codex Account** from the menu bar.
-2. Sign in to another account in Codex, then save it the same way.
+1. Save the account already signed in to Codex with **Save Current Codex Account**.
+2. Choose **Add Another Codex Account…** and complete the official Codex sign-in in your browser.
 3. Use **Codex Accounts** in the menu bar, or **Switch** on a medium/large widget, to change accounts.
 
 Each saved account gets an isolated local Codex home for quota refresh. Credentials are stored in macOS Keychain. Removing an account from the menu deletes the widget's saved Keychain item; it does not delete the account itself.

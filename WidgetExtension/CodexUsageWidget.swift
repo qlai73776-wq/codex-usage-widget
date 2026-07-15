@@ -138,7 +138,51 @@ struct CodexUsageWidgetView: View {
     let entry: UsageEntry
 
     var body: some View {
-        if family == .systemSmall { small } else { detailed }
+        switch family {
+        case .systemSmall: small
+        case .systemMedium: medium
+        default: detailed
+        }
+    }
+
+    private var medium: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .top, spacing: 10) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(entry.email).font(.system(size: 16, weight: .semibold)).lineLimit(1)
+                    Text("Codex · \(entry.plan)").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 6)
+                VStack(alignment: .trailing, spacing: 0) {
+                    Text("\(entry.remaining)%").font(.system(size: 27, weight: .bold, design: .rounded)).foregroundStyle(entry.remaining <= 20 ? .orange : .green)
+                    Text("重置券 \(entry.resetCredits)").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            ProgressView(value: Double(entry.remaining), total: 100)
+                .tint(entry.remaining <= 20 ? .orange : .green)
+            if let alternate = entry.accounts
+                .filter({ !$0.current && $0.email.contains("@") })
+                .sorted(by: { $0.remaining > $1.remaining }).first {
+                HStack(spacing: 7) {
+                    Circle().fill(Color.secondary.opacity(0.35)).frame(width: 7, height: 7)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(alternate.email).font(.caption.bold()).lineLimit(1)
+                        Text("\(alternate.plan) · 剩余 \(alternate.remaining)%").font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button(intent: SwitchCodexAccountIntent(accountID: alternate.id)) { Text("切换") }
+                        .buttonStyle(.bordered).controlSize(.small).font(.caption2)
+                }
+            }
+            Divider()
+            HStack(spacing: 16) {
+                metric("已用", "\(entry.used)%")
+                metric("今日 Tokens", compact(entry.todayTokens))
+                metric("累计 Tokens", compact(entry.lifetimeTokens))
+            }
+        }
+        .frame(maxHeight: .infinity, alignment: .top)
+        .containerBackground(.fill.tertiary, for: .widget)
     }
 
     private var small: some View {
