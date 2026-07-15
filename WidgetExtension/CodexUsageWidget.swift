@@ -158,7 +158,7 @@ struct CodexUsageWidgetView: View {
     }
 
     private var detailed: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: family == .systemMedium ? 7 : 12) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(entry.email).font(.headline).lineLimit(1)
@@ -166,7 +166,7 @@ struct CodexUsageWidgetView: View {
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 4) {
-                    Text("\(entry.remaining)%").font(.system(size: 34, weight: .bold, design: .rounded)).foregroundStyle(entry.remaining <= 20 ? .orange : .green)
+                    Text("\(entry.remaining)%").font(.system(size: family == .systemMedium ? 28 : 34, weight: .bold, design: .rounded)).foregroundStyle(entry.remaining <= 20 ? .orange : .green)
                     resetControl(compact: false)
                 }
             }
@@ -181,21 +181,26 @@ struct CodexUsageWidgetView: View {
                 metric("累计 Tokens", compact(entry.lifetimeTokens))
                 if family == .systemLarge { metric("连续使用", "\(entry.streakDays) 天") }
             }
-            Spacer(minLength: 0)
-            HStack {
-                Label(resetText, systemImage: "clock.arrow.circlepath")
-                Spacer()
-                if !entry.resetStatus.isEmpty { Text(entry.resetStatus) }
-                else if let updated = entry.updatedAt { Text(updated, style: .time) }
+            if family == .systemLarge {
+                Spacer(minLength: 0)
+                HStack {
+                    Label(resetText, systemImage: "clock.arrow.circlepath")
+                    Spacer()
+                    if !entry.resetStatus.isEmpty { Text(entry.resetStatus) }
+                    else if let updated = entry.updatedAt { Text(updated, style: .time) }
+                }
+                .font(.caption2).foregroundStyle(.secondary)
             }
-            .font(.caption2).foregroundStyle(.secondary)
         }
         .containerBackground(.fill.tertiary, for: .widget)
     }
 
     private var accountList: some View {
         VStack(spacing: 6) {
-            ForEach(Array(entry.accounts.sorted(by: { $0.remaining > $1.remaining }).prefix(family == .systemLarge ? 5 : 2))) { account in
+            ForEach(Array(entry.accounts.sorted(by: {
+                if $0.current != $1.current { return $0.current }
+                return $0.remaining > $1.remaining
+            }).prefix(family == .systemLarge ? 5 : 1))) { account in
                 HStack(spacing: 7) {
                     Circle().fill(account.current ? Color.green : Color.secondary.opacity(0.35)).frame(width: 7, height: 7)
                     VStack(alignment: .leading, spacing: 1) {

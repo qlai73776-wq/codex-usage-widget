@@ -57,6 +57,7 @@ final class AccountVault {
         try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         let home = support.appendingPathComponent("Accounts/\(id)", isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        try "cli_auth_credentials_store = \"keyring\"\n".write(to: home.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
         try storeSecret(auth, service: "Codex Auth", account: codexKeychainAccount(home: home))
         var all = accounts().filter { $0.id != id }
         let item = SavedAccount(id: id, email: snapshot.email, plan: snapshot.plan, remaining: snapshot.remaining, used: snapshot.used, resetsAt: snapshot.resetsAt?.timeIntervalSince1970 ?? 0, lastUpdated: Date().timeIntervalSince1970)
@@ -87,6 +88,16 @@ final class AccountVault {
     }
 
     func home(for id: String) -> URL { support.appendingPathComponent("Accounts/\(id)", isDirectory: true) }
+
+    func prepareHome(for id: String) -> URL {
+        let url = home(for: id)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        let config = url.appendingPathComponent("config.toml")
+        if !FileManager.default.fileExists(atPath: config.path) {
+            try? "cli_auth_credentials_store = \"keyring\"\n".write(to: config, atomically: true, encoding: .utf8)
+        }
+        return url
+    }
 
     private func readCurrentAuth() throws -> Data {
         let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/auth.json")
@@ -666,9 +677,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func startClient(for account: SavedAccount) {
         guard accountClients[account.id] == nil else { return }
-        let probe = CodexClient(codexHome: AccountVault.shared.home(for: account.id), publishesWidget: false)
+        let probe = CodexClient(codexHome: AccountVault.shared.prepareHome(for: account.id), publishesWidget: false)
         probe.onUpdate = { [weak self] snapshot in
-            guard snapshot.lastUpdated != nil else { return }
+            guard snapshot.lastUpdated != nil, snapshot.email.contains("@") else { return }
             var updated = account
             updated.email = snapshot.email
             updated.plan = snapshot.plan

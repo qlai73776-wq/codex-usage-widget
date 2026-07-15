@@ -1,5 +1,7 @@
 # Codex Usage Widget
 
+<p align="center"><img src="Assets/AppIcon-1024.png" width="128" alt="Codex Usage Widget icon"></p>
+
 A native macOS menu bar companion and WidgetKit widget for monitoring and switching between Codex accounts.
 
 ![macOS](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
