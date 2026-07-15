@@ -18,6 +18,9 @@ struct UsageSnapshot {
     var todayTokens: Int64?
     var streakDays: Int64?
     var creditBalance: String?
+    var resetCredits = 0
+    var resetCreditID: String?
+    var resetStatus: String?
     var lastUpdated: Date?
     var error: String?
 }
@@ -30,6 +33,7 @@ final class CodexClient {
     private var snapshot = UsageSnapshot()
     private var timer: Timer?
     private var accountWatchTimer: Timer?
+    private var resetRequestTimer: Timer?
     private var authModificationDate: Date?
     private var nextID = 1
 
@@ -48,11 +52,15 @@ final class CodexClient {
                 self.refresh()
             }
         }
+        resetRequestTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.consumePendingResetRequest()
+        }
     }
 
     func stop() {
         timer?.invalidate()
         accountWatchTimer?.invalidate()
+        resetRequestTimer?.invalidate()
         process?.terminate()
     }
 
@@ -142,6 +150,7 @@ final class CodexClient {
             if id == 2 { parseAccount(result) }
             if id == 3 { parseLimits(result) }
             if id == 4 { parseUsage(result) }
+            if id == 5 { parseResetOutcome(result) }
             return
         }
         if let method = json["method"] as? String {
@@ -171,6 +180,15 @@ final class CodexClient {
 
     private func parseLimits(_ result: [String: Any]) {
         if let limits = result["rateLimits"] as? [String: Any] { parseLimitSnapshot(limits) }
+        if let reset = result["rateLimitResetCredits"] as? [String: Any] {
+            snapshot.resetCredits = reset["availableCount"] as? Int ?? (reset["availableCount"] as? NSNumber)?.intValue ?? 0
+            if let credits = reset["credits"] as? [[String: Any]] {
+                snapshot.resetCreditID = credits.first?["id"] as? String
+            } else {
+                snapshot.resetCreditID = nil
+            }
+        }
+        publish()
     }
 
     private func parseLimitSnapshot(_ limits: [String: Any]) {
@@ -206,6 +224,31 @@ final class CodexClient {
         publish()
     }
 
+    private func consumePendingResetRequest() {
+        let url = URL(fileURLWithPath: "/private/tmp/io.github.codexusage/reset-request.json")
+        guard let data = try? Data(contentsOf: url),
+              let request = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let key = request["idempotencyKey"] as? String else { return }
+        try? FileManager.default.removeItem(at: url)
+        var params: [String: Any] = ["idempotencyKey": key]
+        if let creditID = snapshot.resetCreditID { params["creditId"] = creditID }
+        snapshot.resetStatus = "正在重置…"
+        publish()
+        send(method: "account/rateLimitResetCredit/consume", params: params, id: 5)
+    }
+
+    private func parseResetOutcome(_ result: [String: Any]) {
+        let outcome = result["outcome"] as? String ?? "unknown"
+        snapshot.resetStatus = [
+            "reset": "重置成功",
+            "nothingToReset": "当前无需重置",
+            "noCredit": "没有可用重置券",
+            "alreadyRedeemed": "本次重置已完成"
+        ][outcome] ?? "重置结果未知"
+        publish()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.refresh() }
+    }
+
     private func number(_ value: Any?) -> Int64? {
         if let value = value as? Int64 { return value }
         if let value = value as? Int { return Int64(value) }
@@ -227,6 +270,9 @@ final class CodexClient {
             "lifetimeTokens": snapshot.lifetimeTokens ?? 0,
             "todayTokens": snapshot.todayTokens ?? 0,
             "streakDays": snapshot.streakDays ?? 0,
+            "resetCredits": snapshot.resetCredits,
+            "resetCreditID": snapshot.resetCreditID ?? "",
+            "resetStatus": snapshot.resetStatus ?? "",
             "lastUpdated": snapshot.lastUpdated?.timeIntervalSince1970 ?? 0
         ]
         if let data = try? JSONSerialization.data(withJSONObject: values) {

@@ -16,6 +16,8 @@ A native macOS menu bar companion and WidgetKit widget for monitoring the curren
 - Automatic refresh every 45 seconds
 - Near-immediate refresh after a Codex account change
 - Optional notifications at 20% and 10% remaining
+- Displays earned Codex reset-credit count
+- Two-step interactive widget action to redeem an available reset credit
 - Launch at login
 
 ## Privacy
@@ -71,6 +73,15 @@ Native WidgetKit widget
 ```
 
 The menu bar's **Refresh Now** action uses the same path as automatic refresh; it is optional and intended for diagnostics.
+
+## Reset credits
+
+When Codex reports an earned reset credit, the widget displays the available count. Redeeming is intentionally a two-step action:
+
+1. Click **Reset Credit N**.
+2. Click **Confirm Reset** within 30 seconds.
+
+The menu bar synchronizer then calls Codex's local `account/rateLimitResetCredit/consume` method with a unique idempotency key and refreshes the rate-limit snapshot. If no current window is eligible, Codex returns `nothingToReset` and no successful reset is reported.
 
 ## Security
 
